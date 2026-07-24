@@ -232,6 +232,8 @@ pub fn callFnFromArgs(func: anytype, app: App, args_start: usize, args: []const 
 }
 
 pub fn dispatch(app: App, args_start: usize, args: []const []const u8) !void {
+    if (args.len -| args_start < 1) return error.Invalid;
+
     inline for (comptime std.meta.declarations(App)) |d| {
         if (std.meta.hasFn(App, d.name) and std.mem.eql(u8, d.name, args[args_start]))
             return callFnFromArgs(@field(App, d.name), app, args_start + 1, args);
