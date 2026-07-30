@@ -1,9 +1,14 @@
-# slap-zig
+# zig-slap
 
-A command line parser library that makes heavy use of the zig's comptime feature. Read the tests within the [slap.zig](src/slap.zig) file to get an idea of how it works
+A simple library for generating command line flags based on function arguments using zig's comptime feature.
+oh, and it's for zig only
+
+## Installation
+
+This "library" is contained in a single file, and currently it only has two public functions so just copy the (slap.zig)[slap.zig] file in a file within your src/ directory and the installation is done.
 
 ## TODO
 
-- generate usage text
+- usage text
 - user friendly error logs
-- write documentation
+- documentation
