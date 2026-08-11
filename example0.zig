@@ -1,5 +1,5 @@
 //! Zig 0.16.0 single file parallel downloader demo by nubskr
-//! modified by me.
+//! stolen abd modified by me.
 //!
 //! original: https://gist.github.com/nubskr/c2b4a4ce3c16214c18718e24471520c6
 
@@ -7,19 +7,41 @@ const std = @import("std");
 
 const slap = @import("slap.zig");
 
+const AppCtx = struct {
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+};
+
+const Uri = struct {
+    uri: std.Uri,
+
+    pub fn parseFromArgs(args: []const []const u8) !struct { Uri, usize } {
+        if (args.len < 1) return error.MissingArgs;
+        return .{ .{ .uri = try std.Uri.parse(args[0]) }, 1 };
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    try slap.invokeFromArgs(std.mem.Allocator, run, init.gpa, 1, args, .{});
+    try slap.invoke(AppCtx, .{
+        .gpa = init.gpa,
+        .arena = init.arena.allocator(),
+    }, download, 1, args);
 }
 
-fn run(gpa: std.mem.Allocator, w_uri: Uri, flags: struct {
+fn download(ctx: AppCtx, flags: struct {
     output: ?[]const u8 = null,
     async_limit: usize = 10,
     concurrent_limit: usize = 20,
-    interactive: bool = false,
-}) !void {
+
+    pub const flags_config: slap.FlagsConfig(@This()) = .{
+        .add_short_flags = true,
+    };
+}, w_uri: Uri) !void {
     const uri = w_uri.uri;
+    const gpa = ctx.gpa;
+    const arena = ctx.arena;
 
     var threaded: std.Io.Threaded = .init(gpa, .{
         .async_limit = .limited(flags.async_limit),
@@ -35,24 +57,60 @@ fn run(gpa: std.mem.Allocator, w_uri: Uri, flags: struct {
     };
     defer client.deinit();
 
-    const destination = flags.output orelse destinationName(uri);
+    var destination = flags.output orelse destinationName(uri);
 
-    const bytes_written = try download(gpa, &client, uri, destination, .{
-        .interactive = flags.interactive,
-        .async_limit = flags.async_limit,
-    });
+    const cwd: std.Io.Dir = .cwd();
 
-    std.log.info("saved {s} ({d} bytes)", .{ destination, bytes_written });
-}
+    var file = cwd.createFile(io, destination, .{}) catch |err| switch (err) {
+        error.IsDir => blk: {
+            destination = try std.fs.path.join(arena, &.{ destination, destinationName(uri) });
+            break :blk try cwd.createFile(io, destination, .{});
+        },
+        else => return err,
+    };
+    defer file.close(io);
 
-const Uri = struct {
-    uri: std.Uri,
+    const total = try remoteFileSize(&client, uri);
+    if (total != 0) {
+        const chunk_count: usize = @intCast(@min(total, flags.async_limit));
 
-    pub fn parseFromArgs(args: []const []const u8) !struct { Uri, usize } {
-        if (args.len < 1) return error.MissingArgs;
-        return .{ .{ .uri = try std.Uri.parse(args[0]) }, 1 };
+        const futures = try gpa.alloc(
+            std.Io.Future(@typeInfo(@TypeOf(downloadChunk)).@"fn".return_type.?),
+            flags.async_limit,
+        );
+        var started: usize = 0;
+        defer {
+            for (futures[0..started]) |*future| {
+                _ = future.cancel(io) catch {};
+            }
+
+            gpa.free(futures);
+        }
+
+        const base_len = total / chunk_count;
+        const remainder = total % chunk_count;
+        var start: u64 = 0;
+
+        for (futures[0..chunk_count], 0..) |*future, chunk_index| {
+            const chunk_len = base_len + @intFromBool(chunk_index < remainder);
+            future.* = try io.concurrent(downloadChunk, .{
+                &client,
+                file,
+                uri,
+                start,
+                start + chunk_len - 1,
+            });
+            started += 1;
+            start += chunk_len;
+        }
+
+        for (futures[0..chunk_count]) |*future| {
+            try future.await(io);
+        }
     }
-};
+
+    std.log.info("saved {s} ({d} bytes)", .{ destination, total });
+}
 
 fn destinationName(uri: std.Uri) []const u8 {
     const basename = std.Io.Dir.path.basenamePosix(uri.path.percent_encoded);
@@ -73,81 +131,13 @@ fn remoteFileSize(client: *std.http.Client, uri: std.Uri) !u64 {
     return response.head.content_length orelse error.MissingContentLength;
 }
 
-fn download(
-    gpa: std.mem.Allocator,
-    client: *std.http.Client,
-    uri: std.Uri,
-    destination: []const u8,
-    flags: struct {
-        async_limit: usize,
-        interactive: bool,
-    },
-) !u64 {
-    const io = client.io;
-
-    const cwd: std.Io.Dir = .cwd();
-
-    var file = try cwd.createFile(io, destination, .{ .exclusive = flags.interactive });
-    defer file.close(io);
-
-    const total = try remoteFileSize(client, uri);
-    if (total == 0) return 0;
-
-    const chunk_count: usize = @intCast(@min(total, flags.async_limit));
-
-
-    const futures = try gpa.alloc(std.Io.Future(DownloadChunkError!void), flags.async_limit);
-    var started: usize = 0;
-    defer {
-        for (futures[0..started]) |*future| {
-            _ = future.cancel(io) catch {};
-        }
-
-        gpa.free(futures);
-    }
-
-    const base_len = total / chunk_count;
-    const remainder = total % chunk_count;
-    var start: u64 = 0;
-
-    for (futures[0..chunk_count], 0..) |*future, chunk_index| {
-        const chunk_len = base_len + @intFromBool(chunk_index < remainder);
-        future.* = try io.concurrent(downloadChunk, .{
-            client,
-            file,
-            uri,
-            start,
-            start + chunk_len - 1,
-        });
-        started += 1;
-        start += chunk_len;
-    }
-
-    for (futures[0..chunk_count]) |*future| {
-        try future.await(io);
-    }
-
-    return total;
-}
-
-const DownloadChunkError =
-    std.fmt.BufPrintError ||
-    std.Io.Writer.Error ||
-    std.Io.File.Writer.Error ||
-    std.Io.File.Writer.SeekError ||
-    std.http.Client.FetchError ||
-    error{
-        RangeRequestRejected,
-        UnexpectedContentLength,
-    };
-
 fn downloadChunk(
     client: *std.http.Client,
     file: std.Io.File,
     uri: std.Uri,
     start: u64,
     end: u64,
-) DownloadChunkError!void {
+) !void {
     const io = client.io;
 
     var range_buffer: [128]u8 = undefined;
