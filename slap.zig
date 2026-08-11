@@ -1,5 +1,178 @@
 const std = @import("std");
 
+fn compileLog(arg: anytype) void {
+    if (false) @compileLog(arg);
+}
+
+pub fn FlagsConfig(comptime T: type) type {
+    return struct {
+        /// add short flags for defaults
+        /// enabling this will limit the
+        /// possible field names and count
+        /// if no custom flags are given
+        add_short_flags: bool = false,
+
+        /// comma seperated custom flags
+        /// for a field empty means
+        /// auto generate from field name
+        flags: StringFieldStruct(T) = .{},
+
+        /// short description about the field
+        /// will be used for making usage info
+        infos: StringFieldStruct(T) = .{},
+    };
+}
+
+/// dispatch the right command (function) through cli arguments
+/// commands are functions declarated to the App type
+pub fn dispatch(
+    comptime App: type,
+    app: App,
+    args_start: usize,
+    args: []const []const u8,
+) !void {
+    if (args.len -| args_start < 1) return error.Invalid;
+
+    inline for (comptime std.meta.declarations(App)) |d| {
+        if (std.meta.hasFn(App, d.name) and std.mem.eql(u8, d.name, args[args_start]))
+            return invoke(App, app, @field(App, d.name), args_start + 1, args);
+    } else {
+        // TODO print usage info
+        return error.UnknownCommand;
+    }
+}
+
+/// invoke the given function taking
+/// parameters from cli arguments
+pub fn invoke(
+    comptime App: type,
+    app: App,
+    func: anytype,
+    args_start: usize,
+    args: []const []const u8,
+) !void {
+    const Param = std.meta.ArgsTuple(@TypeOf(func));
+
+    var params: Param = undefined;
+
+    if (@FieldType(Param, "0") != void) params.@"0" = app;
+
+    var args_cur = args_start;
+
+    if (@FieldType(Param, "1") != void) params.@"1", args_cur =
+        try setFields(App, @FieldType(Param, "1"), app, args_start, args);
+
+    inline for (comptime std.meta.fieldNames(Param)[2..]) |name| @field(params, name), args_cur =
+        try setValue(App, @FieldType(Param, name), app, args_cur, args);
+
+    return @call(.auto, func, params);
+}
+
+/// Set the value for each field
+/// flags are loaded at compile time
+/// long flags must be prefixed with '--'
+/// and short flags must be prefixed with '-'
+///
+/// Short flags can be chained
+/// For example:-
+///     -a 100 -b 155
+///   is equvilent to
+///     -ab 100 155
+///
+/// Booleans must have default values
+fn setFields(
+    comptime App: type,
+    comptime T: type,
+    app: App,
+    args_start: usize,
+    args: []const []const u8,
+) !struct { T, usize } {
+    const long_flags, const short_flags = comptime fieldFlags(T);
+
+    var is_field_set: @Struct(
+        .auto,
+        null,
+        std.meta.fieldNames(T),
+        &@splat(bool),
+        &@splat(.{ .default_value_ptr = @ptrCast(&@as(bool, false)) }),
+    ) = .{};
+
+    var ret: T = undefined;
+
+    var args_cur = args_start;
+    while (args_cur < args.len) {
+        if (std.mem.startsWith(u8, args[args_cur], "--")) {
+            const arg = args[args_cur][2..];
+            args_cur += 1;
+
+            if (arg.len == 0) break;
+
+            inline for (&long_flags) |long_flag| {
+                const flag, const field = long_flag;
+
+                if (std.mem.eql(u8, arg, flag)) {
+                    if (@field(is_field_set, field)) return error.Conflict;
+
+                    if (@FieldType(T, field) != bool) {
+                        @field(ret, field), args_cur =
+                            try setValue(App, @FieldType(T, field), app, args_cur, args);
+                    }
+
+                    @field(is_field_set, field) = true;
+
+                    break;
+                }
+            } else {
+                return error.InvalidFlag;
+            }
+        } else if (args.len > 1 and args[args_cur][0] == '-') {
+            const arg = args[args_cur][1..];
+            args_cur += 1;
+
+            for (arg) |c| {
+                inline for (&short_flags) |short_flag| {
+                    const flag, const field = short_flag;
+
+                    if (c == flag) {
+                        if (@field(is_field_set, field)) return error.Conflict;
+
+                        if (@FieldType(T, field) != bool) {
+                            @field(ret, field), args_cur =
+                                try setValue(App, @FieldType(T, field), app, args_cur, args);
+                        }
+
+                        @field(is_field_set, field) = true;
+
+                        break;
+                    }
+                } else {
+                    return error.InvalidFlag;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    inline for (comptime std.meta.fieldNames(T), @typeInfo(T).@"struct".fields) |field, field_info| {
+        if (!@field(is_field_set, field)) {
+            @field(ret, field) = field_info.defaultValue() orelse return error.MissingFlag;
+        } else if (field_info.type == bool) {
+            @field(ret, field) =
+                !(field_info.defaultValue() orelse @compileError("boolean fields must have default value"));
+        }
+    }
+
+    return .{ ret, args_cur };
+}
+
+/// Set a value through cli argumnts
+/// can handle premitive types like
+/// ints, floats, enums, and strings
+/// and any type that has `parseFromArgs`
+/// method. Optional types are handled
+/// and if the type is array, this
+/// function is called for each element
 fn setValue(
     comptime App: type,
     comptime T: type,
@@ -13,16 +186,16 @@ fn setValue(
     };
 
     switch (U) {
-        bool => return .{ true, args_start },
         []const u8 => {
             if (try std.math.sub(usize, args.len, args_start) < 1) return error.Invalid;
             return .{ args[args_start], args_start + 1 };
         },
+        []const []const u8 => return .{ args[args_start..], args.len },
         else => {},
     }
 
     const V = switch (@typeInfo(U)) {
-        .pointer => |info| info.child,
+        inline .pointer, .vector => |info| info.child,
         else => U,
     };
 
@@ -56,9 +229,7 @@ fn setValue(
         },
         .float => .float,
         .@"enum" => .@"enum",
-        inline .array, .vector => |info| {
-            if (info.child == bool) @compileError("invalid field type");
-
+        .array => |info| {
             var ret: U = undefined;
 
             var args_cur = args_start;
@@ -81,190 +252,310 @@ fn setValue(
     }, args_start + 1 };
 }
 
-pub const Config = struct {
-    enable_flag_alias: bool = true,
-};
+/// Loads the cli flags for each field
+/// flags are taken from T.flags_config.flags
+/// single character flags will be short flags
+///
+/// If T.flags_config is not declared or
+/// if the flag set for that field is empty,
+/// the flag will be the field name but the
+/// underscores are replaced with hyphens
+/// and a short flag will also be added if
+/// T.add_short_flags is set to true
+fn fieldFlags(comptime T: type) struct {
+    [fieldFlagsCount(T)[0]][2][]const u8,
+    [fieldFlagsCount(T)[1]]struct { u8, []const u8 },
+} {
+    const long_count, const short_count = fieldFlagsCount(T);
 
-fn setFlags(
-    comptime App: type,
-    comptime T: type,
-    app: App,
-    args_start: usize,
-    args: []const []const u8,
-    comptime config: Config,
-) !struct { T, usize } {
-    const fields = @typeInfo(T).@"struct".fields;
+    var long: [long_count][2][]const u8 = @splat(.{ &.{}, &.{} });
+    var short: [short_count]struct { u8, []const u8 } = @splat(.{ 0, &.{} });
 
-    comptime {
-        for (fields) |f| {
-            for (f.name) |c| switch (c) {
-                'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
+    var long_idx = 0;
+    var short_idx = 0;
+
+    const flags_config: FlagsConfig(T) = if (@hasDecl(T, "flags_config")) T.flags_config else .{};
+
+    for (std.meta.fieldNames(T)) |key| {
+        const flag_set = @field(flags_config.flags, key);
+
+        if (flag_set.len != 0) {
+            var idx = 0;
+            while (idx < flag_set.len) {
+                const len = std.mem.findScalarPos(u8, flag_set, idx, ',') orelse flag_set.len;
+                defer idx = len + 1;
+
+                if (len - idx != 1) {
+                    long[long_idx][0] = flag_set[idx..len];
+                    long[long_idx][1] = key;
+                    long_idx += 1;
+                } else {
+                    short[short_idx].@"0" = flag_set[idx];
+                    short[short_idx].@"1" = key;
+                    short_idx += 1;
+                }
+            }
+        } else {
+            var long_flag: [key.len]u8 = @splat(0);
+            for (key, 0..) |c, i| long_flag[i] = switch (c) {
+                'a'...'z', '0'...'9', 'A'...'Z' => c,
+                '_' => '-',
                 else => @compileError("field name contains invalid characters"),
             };
 
-            if (f.name.len < 2) {
-                @compileError("field name '" ++ f.name ++ "' is too small");
+            const long_flag_const = long_flag;
+            long[long_idx][0] = &long_flag_const;
+
+            long[long_idx][1] = key;
+            long_idx += 1;
+
+            if (flags_config.add_short_flags) {
+                short[short_idx].@"0" = key[0];
+                short[short_idx].@"1" = key;
+                short_idx += 1;
             }
-
-            if (!std.ascii.isAlphabetic(f.name[0])) {
-                @compileError("feild name must start with an alphabet");
-            }
-
-            if (f.name[f.name.len - 1] == '_') {
-                @compileError("feild name must not end with start with '_'");
-            }
-
-            if (f.type == bool and f.default_value_ptr == null) {
-                @compileError("boolean fields must have default value");
-            }
-        }
-
-        if (config.enable_flag_alias) {
-            var letters: struct {
-                tbl: [26 * 26]bool = @splat(false),
-
-                fn check(self: *@This(), c: u8) void {
-                    const idx = switch (c) {
-                        'a'...'z' => c - 'a',
-                        'A'...'Z' => 26 + c - 'A',
-                        else => unreachable,
-                    };
-
-                    if (self.tbl[idx]) @compileError("all fields must start with different letter");
-                    self.tbl[idx] = true;
-                }
-            } = .{};
-
-            for (fields) |f| letters.check(f.name[0]);
         }
     }
 
-    var is_field_set: [fields.len]bool = @splat(false);
+    std.debug.assert(long_idx == long_count);
+    std.debug.assert(short_idx == short_count);
 
-    var opts: T = undefined;
+    // ensure there are no repeating flags
+    var flags: [long_count + short_count][]const u8 = undefined;
 
-    var args_cur = args_start;
-    while (args_cur < args.len) {
-        if (std.mem.startsWith(u8, args[args_cur], "--")) {
-            const flag = args[args_cur][2..];
-            args_cur += 1;
+    for (long, 0..) |l, idx| flags[idx] = l[0];
+    for (short, long_count..) |s, idx| flags[idx] = &.{s.@"0"};
 
-            if (flag.len == 0) break;
+    // this will fail if there are duplicte flags
+    // i don't feel like doing this the normal way
+    _ = @typeInfo(@Struct(.auto, null, &flags, &@splat(void), &@splat(.{}))).@"struct";
 
-            inline for (fields, 0..) |f, idx| {
-                if (std.mem.eql(u8, comptime blk: {
-                    var buf: [f.name.len]u8 = undefined;
-                    for (f.name, 0..) |c, i| {
-                        buf[i] = if (c == '_') '-' else c;
-                    }
+    return .{ long, short };
+}
 
-                    const bu2 = buf;
-                    break :blk &bu2;
-                }, flag)) {
-                    if (is_field_set[idx]) return error.Conflict;
+/// calculates the count of
+/// the flags ahead of time
+fn fieldFlagsCount(comptime T: type) [2]comptime_int {
+    const flags_config: FlagsConfig(T) = if (@hasDecl(T, "flags_config")) T.flags_config else .{};
 
-                    @field(opts, f.name), args_cur =
-                        try setValue(App, @FieldType(T, f.name), app, args_cur, args);
+    var long_count = 0;
+    var short_count = 0;
 
-                    is_field_set[idx] = true;
+    for (std.meta.fieldNames(T)) |key| {
+        const flag_set = @field(flags_config.flags, key);
 
-                    break;
-                }
-            } else return error.Invalid;
-        } else if (config.enable_flag_alias and args[args_cur][0] == '-') {
-            const flag = args[args_cur];
-            args_cur += 1;
+        if (flag_set.len != 0) {
+            validateFlagSet(flag_set);
 
-            for (flag[1..]) |c| {
-                inline for (fields, 0..) |f, idx| {
-                    if (f.name[0] == c) {
-                        if (is_field_set[idx]) return error.Conflict;
+            var idx = 0;
+            while (idx < flag_set.len) {
+                const len = std.mem.findScalarPos(u8, flag_set, idx, ',') orelse flag_set.len;
+                defer idx = len + 1;
 
-                        @field(opts, f.name), args_cur =
-                            try setValue(App, @FieldType(T, f.name), app, args_cur, args);
-
-                        is_field_set[idx] = true;
-
-                        break;
-                    }
-                } else return error.Invalid;
+                (if (len - idx != 1) long_count else short_count) += 1;
             }
         } else {
-            break;
+            validateFieldName(key);
+
+            long_count += 1;
+            if (flags_config.add_short_flags) short_count += 1;
         }
     }
 
-    inline for (&is_field_set, fields) |s, f| if (!s) {
-        @field(opts, f.name) = f.defaultValue() orelse return error.Invalid;
-    } else if (f.type == bool) {
-        @field(opts, f.name) = !f.defaultValue().?;
+    return .{ long_count, short_count };
+}
+
+/// function that turns this
+/// struct {
+///     field1: f32,
+///     field2: isize = 67,
+///     other_field: SomeType,
+/// }
+/// into this
+/// struct {
+///     field1: []const u8 = &.{},
+///     field2: []const u8 = &.{},
+///     other_field: []const u8 = &.{},
+/// }
+fn StringFieldStruct(comptime T: type) type {
+    _ = @typeInfo(T).@"struct";
+
+    return @Struct(
+        .auto,
+        null,
+        std.meta.fieldNames(T),
+        &@splat([]const u8),
+        &@splat(.{ .default_value_ptr = @ptrCast(&@as([]const u8, &.{})) }),
+    );
+}
+
+/// ensures the flag set only contains
+/// valid characters and no empty flags
+fn validateFlagSet(flag_set: []const u8) void {
+    if (flag_set.len == 0) @compileError("empty flag set");
+
+    for (flag_set) |c| switch (c) {
+        'a'...'z', '0'...'9', 'A'...'Z', '-', ',' => {},
+        else => @compileError("flag set contains invalid character"),
     };
 
-    return .{ opts, args_cur };
+    var idx = 0;
+    while (idx < flag_set.len) {
+        const len = std.mem.findScalarPos(u8, flag_set, idx, ',') orelse flag_set.len;
+        defer idx = len + 1;
+
+        if (idx == len) {
+            @compileError("flag set contains empty flag");
+        }
+
+        if (!std.ascii.isAlphabetic(flag_set[idx])) {
+            @compileError("flag must start with an alphabet");
+        }
+
+        if (!std.ascii.isAlphanumeric(flag_set[len - 1])) {
+            @compileError("flag must end with an alphabet or a number");
+        }
+
+        // allowing only one long flag and a short flag
+        // is probably a good idea
+    }
 }
 
-pub fn invokeFromArgs(
-    comptime App: type,
-    func: anytype,
-    app: App,
-    args_start: usize,
-    args: []const []const u8,
-    comptime config: Config,
-) !void {
-    const ParamType = std.meta.ArgsTuple(@TypeOf(func));
-    const field_names = comptime std.meta.fieldNames(ParamType);
+/// ensures the field name is
+/// suitable to turn into a flag
+fn validateFieldName(field_name: []const u8) void {
+    if (field_name.len < 2) @compileError("field name too short");
 
-    if (field_names.len < 2) {
-        @compileError("function type invalid");
+    for (field_name) |c| switch (c) {
+        'a'...'z', '0'...'9', 'A'...'Z', '_' => {},
+        else => @compileError("field name contains invalid character"),
+    };
+
+    if (!std.ascii.isAlphabetic(field_name[0])) {
+        @compileError("flag must start with an alphabet");
     }
 
-    var params: ParamType = undefined;
-
-    const first = field_names[0];
-    const last = field_names[field_names.len - 1];
-
-    if (@FieldType(ParamType, first) != void) {
-        @field(params, first) = app;
+    if (!std.ascii.isAlphanumeric(field_name[field_name.len - 1])) {
+        @compileError("flag must end with an alphabet or a number");
     }
+}
 
-    var args_cur = args_start;
+test "set value" {
+    var args_cur: usize = 0;
 
-    @field(params, last), args_cur =
-        try setFlags(App, @FieldType(ParamType, last), app, args_start, args, config);
+    const args: []const []const u8 = &.{
+        "0xffff",          "-54",        "7781",          "900",
+        "(45.7, 67)",      "[89, 40]",   "[0,9]",         "abc",
+        "def",             "ghi",        "foobar",        "doover",
+        "slap.zig:414:11", "foo.c:77:9", "bar.txt:99:99", "baz.go:56:8",
+    };
 
-    inline for (field_names[1 .. field_names.len - 1], 1..) |name, i|
-        switch (@FieldType(ParamType, name)) {
-            bool => @compileError("invalid param type"),
-            []const []const u8 => {
-                if (i != field_names.len - 2) @compileError("invalid param type");
-                @field(params, name) = args[args_cur..];
-                break;
-            },
-            else => {
-                @field(params, name), args_cur =
-                    try setValue(App, @FieldType(ParamType, name), app, args_cur, args);
+    const val0, args_cur = try setValue(void, u16, {}, args_cur, args);
+    try std.testing.expectEqual(65535, val0);
+
+    const val1, args_cur = try setValue(void, [3]i32, {}, args_cur, args);
+    try std.testing.expectEqualDeep(@as([3]i32, .{ -54, 7781, 900 }), val1);
+
+    const val2, args_cur = try setValue(void, [3]Vec, {}, args_cur, args);
+    try std.testing.expectEqualDeep(@as([3]Vec, .{
+        .{ .float = .{ .x = 45.7, .y = 67 } },
+        .{ .int = .{ .x = 89, .y = 40 } },
+        .{ .int = .{ .x = 0, .y = 9 } },
+    }), val2);
+
+    const val3, args_cur = try setValue(void, ?[3]TestEnum, {}, args_cur, args);
+    try std.testing.expectEqualDeep(@as([3]TestEnum, .{ .abc, .def, .ghi }), val3 orelse error.Null);
+
+    const val4, args_cur = try setValue(void, ?[]const u8, {}, args_cur, args);
+    try std.testing.expectEqualStrings("foobar", val4 orelse return error.Null);
+
+    const val5, args_cur = try setValue(void, []const u8, {}, args_cur, args);
+    try std.testing.expectEqualStrings("doover", val5);
+
+    const app: TestApp = .init();
+
+    const val6, args_cur = try setValue(TestApp, ?[]FileLocation, app, args_cur, args);
+    if (val6) |v| {
+        defer app.gpa.free(v);
+
+        try std.testing.expectEqualDeep(@as([]const FileLocation, &.{
+            .{ .path = "slap.zig", .line = 414, .col = 11 },
+            .{ .path = "foo.c", .line = 77, .col = 9 },
+            .{ .path = "bar.txt", .line = 99, .col = 99 },
+            .{ .path = "baz.go", .line = 56, .col = 8 },
+        }), v);
+    } else return error.Null;
+
+    try std.testing.expectEqual(args.len, args_cur);
+}
+
+test "set fields" {
+    const app: TestApp = .init();
+
+    const args: []const []const u8 = &.{
+        "-F",           "--shh.js:55:1",
+        "main.go:54:9", "index.html:89:7",
+        "-g",           "foo",
+        "bar",          "baz",
+        "--number",     "-777",
+        "--lAbel",      "far",
+        "--floption",   "--",
+        "--flare",      "33",
+        "--fair",       "32",
+        "--fare",       "45",
+    };
+
+    const Flags = struct {
+        Files: []FileLocation,
+        strings: [3][]const u8,
+        number: isize,
+        lAbel: enum {
+            bar,
+            car,
+            far,
+        },
+        floption: bool = false,
+
+        pub const flags_config: FlagsConfig(@This()) = .{
+            .add_short_flags = true,
+            .flags = .{
+                .strings = "g",
             },
         };
+    };
 
-    return @call(.auto, func, params);
-}
+    const Flags2 = struct {
+        flare: u32,
+        fair: u128,
+        fare: u128,
+    };
 
-pub fn dispatch(
-    comptime App: type,
-    app: App,
-    args_start: usize,
-    args: []const []const u8,
-    comptime config: Config,
-) !void {
-    if (args.len -| args_start < 1) return error.Invalid;
+    const flags, var args_cur = try setFields(TestApp, Flags, app, 0, args);
+    defer app.gpa.free(flags.Files);
 
-    inline for (comptime std.meta.declarations(App)) |d| {
-        if (std.meta.hasFn(App, d.name) and std.mem.eql(u8, d.name, args[args_start]))
-            return invokeFromArgs(App, @field(App, d.name), app, args_start + 1, args, config);
-    } else {
-        // TODO print usage info
-        return error.UnknownCommand;
-    }
+    try std.testing.expectEqualDeep(@as([]const FileLocation, &.{
+        .{ .path = "--shh.js", .line = 55, .col = 1 },
+        .{ .path = "main.go", .line = 54, .col = 9 },
+        .{ .path = "index.html", .line = 89, .col = 7 },
+    }), flags.Files);
+
+    try std.testing.expectEqualDeep(@as([3][]const u8, .{ "foo", "bar", "baz" }), flags.strings);
+
+    try std.testing.expectEqual(-777, flags.number);
+
+    try std.testing.expectEqual(.far, flags.lAbel);
+
+    try std.testing.expect(flags.floption);
+
+    const flags2, args_cur = try setFields(void, Flags2, {}, args_cur, args);
+
+    try std.testing.expectEqualDeep(@as(Flags2, .{
+        .flare = 33,
+        .fair = 32,
+        .fare = 45,
+    }), flags2);
+
+    try std.testing.expectEqual(args.len, args_cur);
 }
 
 const TestApp = struct {
@@ -277,58 +568,21 @@ const TestApp = struct {
         };
     }
 
-    pub fn cmd0(_: void, _: struct {}) void {}
+    pub fn cmd1(_: void, _:void) void {}
 
-    pub fn cmd1(_: void, args: []const []const u8, _: struct {}) !void {
-        try std.testing.expectEqual(4, args.len);
-        try std.testing.expectEqualStrings("foo", args[0]);
-        try std.testing.expectEqualStrings("bar", args[1]);
-        try std.testing.expectEqualStrings("baz", args[2]);
-        try std.testing.expectEqualStrings("bat", args[3]);
-    }
+    // coming up with examples/tests is the hardest part of this project. aaaaaaaaahhh
+};
 
-    pub fn cmd2(app: TestApp, flags: struct {
-        een: E,
-        name: []const u8,
-        foo: f32,
-        bar: bool = true,
-        daz: ?u64 = null,
-    }) void {
-        if (flags.een != std.meta.stringToEnum(E, flags.name) orelse flags.een and
-            flags.foo == 67 and
-            !flags.bar and
-            flags.daz == null)
-        {
-            app.n.?.* = 32;
-        }
-    }
-
-    pub fn cmd3(_: void, n: usize, tail: []const []const u8, flags: struct {
-        magic_claw: u8,
-    }) !void {
-        try std.testing.expectEqual(n + flags.magic_claw, tail.len);
-
-        for (tail) |arg| {
-            try std.testing.expectEqualStrings("aaa", arg);
-        }
-    }
-
-    pub fn cmd4(_: void, tail: []const []const u8, flags: struct {
-        qwerty: ?u32 = null,
-        wertyq: ?u32 = null,
-        ertyqw: ?u32 = null,
-        rtyqwe: ?u32 = null,
-    }) !void {
-        try std.testing.expectEqual(null, flags.qwerty);
-        try std.testing.expectEqual(null, flags.wertyq);
-        try std.testing.expectEqual(10, flags.ertyqw);
-        try std.testing.expectEqual(20, flags.rtyqwe);
-
-        try std.testing.expectEqual(3, tail.len);
-        try std.testing.expectEqualStrings("--qwe", tail[0]);
-        try std.testing.expectEqualStrings("rty", tail[1]);
-        try std.testing.expectEqualStrings("--uio", tail[2]);
-    }
+const TestEnum = enum {
+    abc,
+    def,
+    ghi,
+    jkl,
+    mno,
+    pqr,
+    stu,
+    vwx,
+    yz,
 };
 
 const Vec = union(enum) {
@@ -421,7 +675,7 @@ const FileLocation = struct {
 
         var args_cur: usize = 0;
         for (args) |arg| {
-            if (arg.len == 0 or (arg[0] == '-' and std.mem.countScalar(u8, arg, ':') == 0)) break;
+            if (arg.len == 0 or (arg[0] == '-' and std.mem.findScalar(u8, arg, ':') == null)) break;
 
             var loc: FileLocation = .{
                 .path = &.{},
@@ -453,149 +707,3 @@ const FileLocation = struct {
         return .{ try list.toOwnedSlice(app.gpa), args_cur };
     }
 };
-
-const E = enum {
-    abc,
-    def,
-    ghi,
-};
-
-test "set value" {
-    var args_cur: usize = 0;
-
-    const args: []const []const u8 = &.{
-        "0xffff",          "-54",        "7781",          "900",
-        "(45.7, 67)",      "[89, 40]",   "[0,9]",         "abc",
-        "def",             "ghi",        "foobar",        "doover",
-        "slap.zig:414:11", "foo.c:77:9", "bar.txt:99:99", "baz.go:56:8",
-    };
-
-    const val0, args_cur = try setValue(void, u16, {}, args_cur, args);
-    try std.testing.expectEqual(65535, val0);
-
-    const val1, args_cur = try setValue(void, [3]i32, {}, args_cur, args);
-    try std.testing.expectEqualDeep(@as([3]i32, .{ -54, 7781, 900 }), val1);
-
-    const val2, args_cur = try setValue(void, [3]Vec, {}, args_cur, args);
-    try std.testing.expectEqualDeep(@as([3]Vec, .{
-        .{ .float = .{ .x = 45.7, .y = 67 } },
-        .{ .int = .{ .x = 89, .y = 40 } },
-        .{ .int = .{ .x = 0, .y = 9 } },
-    }), val2);
-
-    const val3, args_cur = try setValue(void, ?[3]E, {}, args_cur, args);
-    try std.testing.expectEqualDeep(@as([3]E, .{ .abc, .def, .ghi }), val3 orelse error.Null);
-
-    const val4, args_cur = try setValue(void, []const u8, {}, args_cur, args);
-    try std.testing.expectEqualStrings("foobar", val4);
-
-    const val5, args_cur = try setValue(void, []const u8, {}, args_cur, args);
-    try std.testing.expectEqualStrings("doover", val5);
-
-    const app: TestApp = .{ .gpa = std.testing.allocator };
-
-    const val6, args_cur = try setValue(TestApp, ?[]FileLocation, app, args_cur, args);
-    if (val6) |v| {
-        defer app.gpa.free(v);
-
-        try std.testing.expectEqualDeep(@as([]const FileLocation, &.{
-            .{ .path = "slap.zig", .line = 414, .col = 11 },
-            .{ .path = "foo.c", .line = 77, .col = 9 },
-            .{ .path = "bar.txt", .line = 99, .col = 99 },
-            .{ .path = "baz.go", .line = 56, .col = 8 },
-        }), v);
-    } else return error.Null;
-
-    try std.testing.expectEqual(args.len, args_cur);
-
-    var val7: [255]bool = undefined;
-    for (&val7) |*v| {
-        v.*, args_cur = try setValue(void, bool, {}, args_cur, args);
-    }
-
-    try std.testing.expectEqualDeep(@as([255]bool, @splat(true)), val7);
-
-    try std.testing.expectEqual(args.len, args_cur);
-}
-
-test "set flags" {
-    const app: TestApp = .{ .gpa = std.testing.allocator };
-
-    const Flags = struct {
-        Files: []FileLocation,
-        strings: [3][]const u8,
-        number: isize,
-        lAbel: enum {
-            bar,
-            car,
-            far,
-        },
-        option: bool = false,
-    };
-
-    const Flags2 = struct {
-        flare: u32,
-        fair: u128,
-        fare: u128,
-    };
-
-    const args: []const []const u8 = &.{
-        "-F",           "--shh.js:55:1",
-        "main.go:54:9", "index.html:89:7",
-        "--strings",    "foo",
-        "bar",          "baz",
-        "--number",     "-777",
-        "--lAbel",      "far",
-        "--option",     "--",
-        "--flare",      "33",
-        "--fair",       "32",
-        "--fare",       "45",
-    };
-
-    const flags, var args_cur = try setFlags(TestApp, Flags, app, 0, args, .{});
-    defer app.gpa.free(flags.Files);
-
-    try std.testing.expectEqualDeep(@as([]const FileLocation, &.{
-        .{ .path = "--shh.js", .line = 55, .col = 1 },
-        .{ .path = "main.go", .line = 54, .col = 9 },
-        .{ .path = "index.html", .line = 89, .col = 7 },
-    }), flags.Files);
-
-    try std.testing.expectEqualDeep(@as([3][]const u8, .{ "foo", "bar", "baz" }), flags.strings);
-
-    try std.testing.expectEqual(-777, flags.number);
-
-    try std.testing.expectEqual(.far, flags.lAbel);
-
-    try std.testing.expect(flags.option);
-
-    const flags2, args_cur = try setFlags(void, Flags2, {}, args_cur, args, .{ .enable_flag_alias = false });
-
-    try std.testing.expectEqualDeep(@as(Flags2, .{
-        .flare = 33,
-        .fair = 32,
-        .fare = 45,
-    }), flags2);
-
-    try std.testing.expectEqual(args.len, args_cur);
-}
-
-test "dispatch" {
-    var number: usize = 0;
-    const app: TestApp = .{ .gpa = std.testing.allocator, .n = &number };
-
-    try dispatch(TestApp, app, 0, &.{"cmd0"}, .{});
-
-    try dispatch(TestApp, app, 0, &.{ "cmd1", "foo", "bar", "baz", "bat" }, .{});
-
-    try dispatch(TestApp, app, 0, &.{ "cmd2", "-en", "abc", "def", "--foo", "67", "--bar" }, .{});
-    try std.testing.expectEqual(number, 32);
-
-    try dispatch(TestApp, app, 0, &.{
-        "cmd3", "--magic-claw", "3",   "5",
-        "aaa",  "aaa",          "aaa", "aaa",
-        "aaa",  "aaa",          "aaa", "aaa",
-    }, .{});
-
-    try dispatch(TestApp, app, 0, &.{ "cmd4", "-er", "10", "20", "--", "--qwe", "rty", "--uio" }, .{});
-}
