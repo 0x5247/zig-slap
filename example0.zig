@@ -1,5 +1,5 @@
 //! Zig 0.16.0 single file parallel downloader demo by nubskr
-//! stolen abd modified by me.
+//! stolen and modified by me.
 //!
 //! original: https://gist.github.com/nubskr/c2b4a4ce3c16214c18718e24471520c6
 
@@ -74,10 +74,8 @@ fn download(ctx: AppCtx, flags: struct {
     if (total != 0) {
         const chunk_count: usize = @intCast(@min(total, flags.async_limit));
 
-        const futures = try gpa.alloc(
-            std.Io.Future(@typeInfo(@TypeOf(downloadChunk)).@"fn".return_type.?),
-            flags.async_limit,
-        );
+        const futures =
+            try gpa.alloc(std.Io.Future(@typeInfo(@TypeOf(downloadChunk)).@"fn".return_type.?), chunk_count);
         var started: usize = 0;
         defer {
             for (futures[0..started]) |*future| {
@@ -91,7 +89,7 @@ fn download(ctx: AppCtx, flags: struct {
         const remainder = total % chunk_count;
         var start: u64 = 0;
 
-        for (futures[0..chunk_count], 0..) |*future, chunk_index| {
+        for (futures, 0..) |*future, chunk_index| {
             const chunk_len = base_len + @intFromBool(chunk_index < remainder);
             future.* = try io.concurrent(downloadChunk, .{
                 &client,
@@ -104,7 +102,7 @@ fn download(ctx: AppCtx, flags: struct {
             start += chunk_len;
         }
 
-        for (futures[0..chunk_count]) |*future| {
+        for (futures) |*future| {
             try future.await(io);
         }
     }
