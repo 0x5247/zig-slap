@@ -25,6 +25,8 @@ pub fn FlagsConfig(comptime T: type) type {
 
 /// dispatch the right command (function) through cli arguments
 /// commands are functions declarated to the App type
+/// args[args_start] will be the name of the command to execute
+/// the rest of the argswill be parsed as params to that command
 pub fn dispatch(
     comptime App: type,
     app: App,
@@ -60,7 +62,7 @@ pub fn invoke(
     var args_cur = args_start;
 
     if (@FieldType(Param, "1") != void) params.@"1", args_cur =
-        try setFields(App, @FieldType(Param, "1"), app, args_start, args);
+        try setFields(App, @FieldType(Param, "1"), app, args_cur, args);
 
     inline for (comptime std.meta.fieldNames(Param)[2..]) |name| @field(params, name), args_cur =
         try setValue(App, @FieldType(Param, name), app, args_cur, args);
@@ -472,7 +474,7 @@ test "set value" {
     const val5, args_cur = try setValue(void, []const u8, {}, args_cur, args);
     try std.testing.expectEqualStrings("doover", val5);
 
-    const app: TestApp = .init();
+    const app: TestApp = .{ .gpa = std.testing.allocator };
 
     const val6, args_cur = try setValue(TestApp, ?[]FileLocation, app, args_cur, args);
     if (val6) |v| {
@@ -490,7 +492,7 @@ test "set value" {
 }
 
 test "set fields" {
-    const app: TestApp = .init();
+    const app: TestApp = .{ .gpa = std.testing.allocator };
 
     const args: []const []const u8 = &.{
         "-F",           "--shh.js:55:1",
@@ -558,19 +560,62 @@ test "set fields" {
     try std.testing.expectEqual(args.len, args_cur);
 }
 
+test "dispatch" {
+    const app: TestApp = .{ .gpa = std.testing.allocator };
+
+    try dispatch(TestApp, app, 0, &.{"cmd0"});
+    try dispatch(TestApp, app, 0, &.{ "cmd1", "qwe", "rty", "uio" });
+    try dispatch(TestApp, app, 0, &.{ "cmd2", "33", "34" });
+    try dispatch(TestApp, app, 0, &.{ "cmd3", "4", "pqr", "pqr", "pqr", "pqr", "pqr" });
+
+    // a function can be invoked individually
+    // without having to create a app context type
+    try invoke(void, {}, TestApp.cmd3, 0, &.{ "2", "abc", "abc", "abc" });
+}
+
+/// the app context type needs to be sructured
+/// like this to make it work with `dispatch`
+/// an instance of this type will be passed to every function
+/// as the first parameter if the first param is not void
 const TestApp = struct {
+    /// context that the application
+    /// would need goes here
     gpa: std.mem.Allocator,
     n: ?*usize = null,
 
-    fn init() TestApp {
-        return .{
-            .gpa = std.testing.allocator,
-        };
+    /// other functions can exist. privately
+    fn func(n: usize) usize {
+        return n <<| 3;
     }
 
-    pub fn cmd1(_: void, _:void) void {}
+    /// functions that takes no param of any sort
+    pub fn cmd0(_: void, _: void) void {}
 
-    // coming up with examples/tests is the hardest part of this project. aaaaaaaaahhh
+    /// function that just takes the args as it is
+    pub fn cmd1(_: void, _: void, args: []const []const u8) !void {
+        try std.testing.expectEqual(3, args.len);
+
+        try std.testing.expectEqualStrings("qwe", args[0]);
+        try std.testing.expectEqualStrings("rty", args[1]);
+        try std.testing.expectEqualStrings("uio", args[2]);
+    }
+
+    /// function that takes some custom arguments
+    pub fn cmd2(_: void, _: void, n: usize, m: usize) !void {
+        try std.testing.expect(n < m);
+        try std.testing.expectEqual(67, n +% m);
+    }
+
+    /// function that just takes the args as it is
+    /// after taking some custom argumemts
+    pub fn cmd3(_: void, _: void, n: usize, e: TestEnum, args: []const []const u8) !void {
+        try std.testing.expectEqual(n, args.len);
+
+        for (args) |arg|
+            try std.testing.expectEqualStrings(@tagName(e), arg);
+    }
+
+    // todo: add more
 };
 
 const TestEnum = enum {
