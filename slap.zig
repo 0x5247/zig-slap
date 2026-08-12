@@ -63,9 +63,37 @@ pub fn invoke(
 
     if (@FieldType(Param, "1") != void) params.@"1", args_cur =
         try setFields(App, @FieldType(Param, "1"), app, args_cur, args);
+    var initiated_params: usize = 0;
+    errdefer {
+        if (@FieldType(Param, "1") != void)
+            inline for (@typeInfo(@FieldType(Param, "1")).@"struct".fields) |field| {
+                if (std.meta.hasFn(UnwrapType(field.type), "deinitParsedValue")) {
+                    UnwrapType(field.type).deinitParsedValue(app, @field(params.@"1", field.name));
+                }
+            };
 
-    inline for (comptime std.meta.fieldNames(Param)[2..]) |name| @field(params, name), args_cur =
-        try setValue(App, @FieldType(Param, name), app, args_cur, args);
+        inline for (@typeInfo(Param).@"struct".fields[2..], 0..) |field, idx| {
+            if (idx >= initiated_params) break;
+
+            if (std.meta.hasFn(UnwrapType(field.type), "deinitParsedValue")) {
+                UnwrapType(field.type).deinitParsedValue(app, @field(params, field.name));
+            }
+        }
+    }
+
+    inline for (@typeInfo(Param).@"struct".fields[2..]) |field| {
+        const F = field.type;
+
+        if (std.meta.hasFn(UnwrapType(F), "parseFromArgs")) {
+            @field(params, field.name), args_cur = try setValueCustom(App, F, app, args_cur, args);
+        } else {
+            @field(params, field.name), args_cur = try setValue(F, args_cur, args);
+        }
+
+        initiated_params += 1;
+    }
+
+    if (args_cur != args.len) return error.TrailingArgs;
 
     return @call(.auto, func, params);
 }
@@ -91,15 +119,16 @@ fn setFields(
 ) !struct { T, usize } {
     const long_flags, const short_flags = comptime fieldFlags(T);
 
-    var is_field_set: @Struct(
-        .auto,
-        null,
-        std.meta.fieldNames(T),
-        &@splat(bool),
-        &@splat(.{ .default_value_ptr = @ptrCast(&@as(bool, false)) }),
-    ) = .{};
-
     var ret: T = undefined;
+
+    var is_field_set: @Struct(.auto, null, std.meta.fieldNames(T), &@splat(bool), &@splat(
+        .{ .default_value_ptr = @ptrCast(&@as(bool, false)) },
+    )) = .{};
+    errdefer inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (std.meta.hasFn(UnwrapType(field.type), "deinitParsedValue") and
+            @field(is_field_set, field.name))
+            UnwrapType(field.type).deinitParsedValue(app, @field(ret, field.name));
+    };
 
     var args_cur = args_start;
     while (args_cur < args.len) {
@@ -115,9 +144,12 @@ fn setFields(
                 if (std.mem.eql(u8, arg, flag)) {
                     if (@field(is_field_set, field)) return error.Conflict;
 
-                    if (@FieldType(T, field) != bool) {
-                        @field(ret, field), args_cur =
-                            try setValue(App, @FieldType(T, field), app, args_cur, args);
+                    const F = @FieldType(T, field);
+
+                    if (std.meta.hasFn(UnwrapType(F), "parseFromArgs")) {
+                        @field(ret, field), args_cur = try setValueCustom(App, F, app, args_cur, args);
+                    } else if (F != bool) {
+                        @field(ret, field), args_cur = try setValue(F, args_cur, args);
                     }
 
                     @field(is_field_set, field) = true;
@@ -138,9 +170,12 @@ fn setFields(
                     if (c == flag) {
                         if (@field(is_field_set, field)) return error.Conflict;
 
-                        if (@FieldType(T, field) != bool) {
-                            @field(ret, field), args_cur =
-                                try setValue(App, @FieldType(T, field), app, args_cur, args);
+                        const F = @FieldType(T, field);
+
+                        if (std.meta.hasFn(UnwrapType(F), "parseFromArgs")) {
+                            @field(ret, field), args_cur = try setValueCustom(App, F, app, args_cur, args);
+                        } else if (F != bool) {
+                            @field(ret, field), args_cur = try setValue(F, args_cur, args);
                         }
 
                         @field(is_field_set, field) = true;
@@ -156,12 +191,12 @@ fn setFields(
         }
     }
 
-    inline for (comptime std.meta.fieldNames(T), @typeInfo(T).@"struct".fields) |field, field_info| {
-        if (!@field(is_field_set, field)) {
-            @field(ret, field) = field_info.defaultValue() orelse return error.MissingFlag;
-        } else if (field_info.type == bool) {
-            @field(ret, field) =
-                !(field_info.defaultValue() orelse @compileError("boolean fields must have default value"));
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (!@field(is_field_set, field.name)) {
+            @field(ret, field.name) = field.defaultValue() orelse return error.MissingFlag;
+        } else if (field.type == bool) {
+            @field(ret, field.name) =
+                !(field.defaultValue() orelse @compileError("boolean fields must have default value"));
         }
     }
 
@@ -169,16 +204,13 @@ fn setFields(
 }
 
 /// Set a value through cli argumnts
-/// can handle premitive types like
+/// can handle simple types like
 /// ints, floats, enums, and strings
-/// and any type that has `parseFromArgs`
-/// method. Optional types are handled
+/// Optional types are handled
 /// and if the type is array, this
 /// function is called for each element
 fn setValue(
-    comptime App: type,
     comptime T: type,
-    app: App,
     args_start: usize,
     args: []const []const u8,
 ) !struct { T, usize } {
@@ -194,29 +226,6 @@ fn setValue(
         },
         []const []const u8 => return .{ args[args_start..], args.len },
         else => {},
-    }
-
-    const V = switch (@typeInfo(U)) {
-        inline .pointer, .vector => |info| info.child,
-        else => U,
-    };
-
-    if (std.meta.hasFn(V, "parseFromArgs")) {
-        const FnType = @TypeOf(V.parseFromArgs);
-        const ReturnType = @typeInfo(FnType).@"fn".return_type.?;
-
-        const fn_args = switch (std.meta.ArgsTuple(FnType)) {
-            struct { App, []const []const u8 } => .{ app, args[args_start..] },
-            struct { []const []const u8 } => .{args[args_start..]},
-            else => @compileError("wrong function signature for parseFromArgs method"),
-        };
-
-        const val, const args_inc = switch (@typeInfo(ReturnType)) {
-            .error_union => try @call(.auto, V.parseFromArgs, fn_args),
-            else => @call(.auto, V.parseFromArgs, fn_args),
-        };
-
-        return .{ val, try std.math.add(usize, args_start, args_inc) };
     }
 
     const type_type: enum {
@@ -236,7 +245,7 @@ fn setValue(
 
             var args_cur = args_start;
             for (0..info.len) |i| {
-                ret[i], args_cur = try setValue(App, info.child, app, args_cur, args);
+                ret[i], args_cur = try setValue(info.child, args_cur, args);
             }
 
             return .{ ret, args_cur };
@@ -252,6 +261,31 @@ fn setValue(
         .float => try std.fmt.parseFloat(U, args[args_start]),
         .@"enum" => std.meta.stringToEnum(U, args[args_start]) orelse return error.Invalid,
     }, args_start + 1 };
+}
+
+/// Set the value of custom types with
+/// the "parseFromArgs" function declared
+fn setValueCustom(
+    comptime App: type,
+    comptime T: type,
+    app: App,
+    args_start: usize,
+    args: []const []const u8,
+) !struct { T, usize } {
+    const U = UnwrapType(T);
+
+    const Fn = @TypeOf(U.parseFromArgs);
+    const FnArgs = std.meta.ArgsTuple(Fn);
+
+    const fn_args: FnArgs =
+        .{ if (@FieldType(FnArgs, "0") != void) app else {}, args[args_start..] };
+
+    const val, const args_inc = switch (@typeInfo(@typeInfo(Fn).@"fn".return_type.?)) {
+        .error_union => try @call(.auto, U.parseFromArgs, fn_args),
+        else => @call(.auto, U.parseFromArgs, fn_args),
+    };
+
+    return .{ val, try std.math.add(usize, args_start, args_inc) };
 }
 
 /// Loads the cli flags for each field
@@ -391,6 +425,19 @@ fn StringFieldStruct(comptime T: type) type {
     );
 }
 
+/// digs into optional, pointer, array and vector
+/// and returns the core type
+fn UnwrapType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        inline .optional,
+        .pointer,
+        .array,
+        .vector,
+        => |info| UnwrapType(info.child),
+        else => T,
+    };
+}
+
 /// ensures the flag set only contains
 /// valid characters and no empty flags
 fn validateFlagSet(flag_set: []const u8) void {
@@ -446,37 +493,36 @@ test "set value" {
     var args_cur: usize = 0;
 
     const args: []const []const u8 = &.{
-        "0xffff",          "-54",        "7781",          "900",
-        "(45.7, 67)",      "[89, 40]",   "[0,9]",         "abc",
-        "def",             "ghi",        "foobar",        "doover",
-        "slap.zig:414:11", "foo.c:77:9", "bar.txt:99:99", "baz.go:56:8",
+        "0xffff",     "-54",           "7781",        "900",
+        "(45.7, 67)", "[89, 40]",      "abc",         "def",
+        "ghi",        "foobar",        "doover",      "slap.zig:414:11",
+        "foo.c:77:9", "bar.txt:99:99", "baz.go:56:8",
     };
 
-    const val0, args_cur = try setValue(void, u16, {}, args_cur, args);
+    const val0, args_cur = try setValue(u16, args_cur, args);
     try std.testing.expectEqual(65535, val0);
 
-    const val1, args_cur = try setValue(void, [3]i32, {}, args_cur, args);
+    const val1, args_cur = try setValue([3]i32, args_cur, args);
     try std.testing.expectEqualDeep(@as([3]i32, .{ -54, 7781, 900 }), val1);
 
-    const val2, args_cur = try setValue(void, [3]Vec, {}, args_cur, args);
-    try std.testing.expectEqualDeep(@as([3]Vec, .{
-        .{ .float = .{ .x = 45.7, .y = 67 } },
-        .{ .int = .{ .x = 89, .y = 40 } },
-        .{ .int = .{ .x = 0, .y = 9 } },
-    }), val2);
+    var val2, args_cur = try setValueCustom(void, Vec, {}, args_cur, args);
+    try std.testing.expectEqualDeep(@as(Vec, .{ .float = .{ .x = 45.7, .y = 67 } }), val2);
 
-    const val3, args_cur = try setValue(void, ?[3]TestEnum, {}, args_cur, args);
+    val2, args_cur = try setValueCustom(void, Vec, {}, args_cur, args);
+    try std.testing.expectEqualDeep(@as(Vec, .{ .int = .{ .x = 89, .y = 40 } }), val2);
+
+    const val3, args_cur = try setValue(?[3]TestEnum, args_cur, args);
     try std.testing.expectEqualDeep(@as([3]TestEnum, .{ .abc, .def, .ghi }), val3 orelse error.Null);
 
-    const val4, args_cur = try setValue(void, ?[]const u8, {}, args_cur, args);
+    const val4, args_cur = try setValue(?[]const u8, args_cur, args);
     try std.testing.expectEqualStrings("foobar", val4 orelse return error.Null);
 
-    const val5, args_cur = try setValue(void, []const u8, {}, args_cur, args);
+    const val5, args_cur = try setValue([]const u8, args_cur, args);
     try std.testing.expectEqualStrings("doover", val5);
 
     const app: TestApp = .{ .gpa = std.testing.allocator };
 
-    const val6, args_cur = try setValue(TestApp, ?[]FileLocation, app, args_cur, args);
+    const val6, args_cur = try setValueCustom(TestApp, ?[]FileLocation, app, args_cur, args);
     if (val6) |v| {
         defer app.gpa.free(v);
 
@@ -561,16 +607,22 @@ test "set fields" {
 }
 
 test "dispatch" {
+    std.testing.log_level = .debug;
+
     const app: TestApp = .{ .gpa = std.testing.allocator };
 
     try dispatch(TestApp, app, 0, &.{"cmd0"});
     try dispatch(TestApp, app, 0, &.{ "cmd1", "qwe", "rty", "uio" });
     try dispatch(TestApp, app, 0, &.{ "cmd2", "33", "34" });
     try dispatch(TestApp, app, 0, &.{ "cmd3", "4", "pqr", "pqr", "pqr", "pqr", "pqr" });
+    try std.testing.expectError(
+        error.InvalidCharacter,
+        dispatch(TestApp, app, 0, &.{ "cmd4", "foo.txt:56:66", "bar.txt:78:6", "fourty four" }),
+    );
 
     // a function can be invoked individually
     // without having to create a app context type
-    try invoke(void, {}, TestApp.cmd3, 0, &.{ "2", "abc", "abc", "abc" });
+    try invoke(void, {}, TestApp.cmd1, 0, &.{ "qwe", "rty", "uio" });
 }
 
 /// the app context type needs to be sructured
@@ -615,6 +667,14 @@ const TestApp = struct {
             try std.testing.expectEqualStrings(@tagName(e), arg);
     }
 
+    /// if the args parsing fails in the middle
+    /// the resource allocated will be leaked.
+    /// not if "deinitParsedValue" function is
+    /// decalred in that type
+    pub fn cmd4(_: void, _: void, _: []FileLocation, _: u32) !void {
+        try std.testing.expect(false);
+    }
+
     // todo: add more
 };
 
@@ -625,9 +685,8 @@ const TestEnum = enum {
     jkl,
     mno,
     pqr,
-    stu,
-    vwx,
-    yz,
+    stuv,
+    wxyz,
 };
 
 const Vec = union(enum) {
@@ -640,7 +699,7 @@ const Vec = union(enum) {
         y: i32,
     },
 
-    pub fn parseFromArgs(args: []const []const u8) !struct { Vec, usize } {
+    pub fn parseFromArgs(_: void, args: []const []const u8) !struct { Vec, usize } {
         if (args.len < 1) return error.Invalid;
 
         const str = args[0];
@@ -720,7 +779,10 @@ const FileLocation = struct {
 
         var args_cur: usize = 0;
         for (args) |arg| {
-            if (arg.len == 0 or (arg[0] == '-' and std.mem.findScalar(u8, arg, ':') == null)) break;
+            if (std.mem.findScalar(u8, arg, ':') == null) {
+                if (std.mem.eql(u8, arg, "--")) args_cur += 1;
+                break;
+            }
 
             var loc: FileLocation = .{
                 .path = &.{},
@@ -750,5 +812,9 @@ const FileLocation = struct {
         }
 
         return .{ try list.toOwnedSlice(app.gpa), args_cur };
+    }
+
+    pub fn deinitParsedValue(app: TestApp, val: []FileLocation) void {
+        app.gpa.free(val);
     }
 };
